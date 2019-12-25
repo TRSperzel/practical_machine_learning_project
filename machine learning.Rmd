@@ -1,0 +1,242 @@
+---
+title: "Course Project - Practical Machine Learning"
+author: "Freddie Karlbom"
+date: "7/29/2017"
+output: 
+  html_document: 
+    theme: spacelab
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message=FALSE, warning=FALSE)
+
+# Utilise parallell processing
+library(doMC)
+registerDoMC(cores = 4)
+
+library(caret)
+library(randomForest)
+library(tidyverse)
+library(magrittr)
+library(anytime)
+
+set.seed(1337)
+``` 
+
+
+## Executive summary
+Classify how a workout excercise was performed based on sensor data and use the trained model to predict classification of 20 additional rows.
+
+The final ensemble model was built using three different models, Random Forest, GBM and XGBoost and succesfully classified the validation set.
+
+
+## Data analysis
+When exploring the data, it's clear that for very many features in the set are very sparse and contains very little data. In order to reduce the number of features and the complexity, we can thus look at removing unneccessary features that doesn't contain much data. Here a chart showing the share of rows with actual data per column;
+```{r data-analysis}
+rawDataSet <- read_csv('./data/pml-training.csv')
+
+hasDataRate <- apply(rawDataSet, 2, function(x) { sum(!is.na(x))/length(x) })
+plot(hasDataRate)
+
+```
+
+Based on this graph we can set a low threshold for 10% of the rows filled to remove superfluous predictors.
+
+Further, when looking at the time axis, the distribution has stayed the same over time which means time shouldn't be useful for predictions. Thus we can remove the timestamp related columns as well in order to simplify.
+
+```{r data-analysis2}
+classOverTime <- rawDataSet %>% dplyr::select(raw_timestamp_part_1, classe) %>% as.data.frame()
+classOverTime$raw_timestamp_part_1 %<>% anytime() %>% round("day") %>% as.POSIXct()
+classOverTime %<>% group_by(raw_timestamp_part_1, classe) %>% count()
+colnames(classOverTime) <- c('Date', 'Class', 'Frequency')
+
+g <- ggplot(classOverTime, aes(x=Date, y = Frequency, fill=Class))
+g + geom_area(position = 'stack')
+```
+
+
+## Clean and prepare data
+Besides filtering out all the columns I don't want to have as predictors, I convert relevant classes to factors and split the data into a training set, consisting of 80%, and a testing set with the remaining data.
+
+Since there are a lot of missing values still in the dataset, I use rfImpute to impute values into the training set.
+```{r data-preparation}
+fullSet <- rawDataSet
+
+# Remove columns that contain very little data to decrease number of predictors
+has_data <- function(x) { sum(!is.na(x))/length(x) > 0.1 }
+fullSet %<>% select_if(has_data)
+
+# Remove row number and timestamps as they shouldn't matter for classification
+fullSet %<>% dplyr::select(-X1, -raw_timestamp_part_1, -raw_timestamp_part_2, -cvtd_timestamp)
+
+fullSet$user_name %<>% factor()
+fullSet$new_window %<>% factor()
+fullSet$classe %<>% factor()
+
+inTraining <- createDataPartition(fullSet$classe, p=0.8, list=FALSE)
+training <- fullSet[inTraining,]
+test <- fullSet[-inTraining,]
+
+if(!file.exists("./models/trainingImputed.rds")){
+    training.imputed <- rfImpute(classe ~ ., training)
+    saveRDS(training.imputed, "./models/trainingImputed.rds")
+} else {
+    training.imputed <- readRDS("./models/trainingImputed.rds")
+}
+```
+
+
+## Building Models
+I explored a few different alghorithms on a smaller set of data including QDA and GLM but settled on using Random Forest and GBM as those were the main classification alghorithms covered in the course. As a final one, I decided to include xgbTree as that is considered one of the best currently available for many usecases.
+
+Random Forest and xgbTree worked very well with default settings, but GBM required some tuning where I upped the grid search for interaction depth to a maximum of 5, and the max amount of trees to 500, which improved results.
+
+For cross validation, I used the default 25 iterations boosting for rf and xgbTree, but changed to a 10 fold cross validation repeated 3 times for the GBM to decrease the overfitting due to increased number of trees.
+
+```{r building-models}
+# Random Forest
+if(!file.exists("./models/rfModel.rds")){
+    rf.model <- train(classe ~., data=training.imputed, method="rf")
+    saveRDS(rf.model, "./models/rfModel.rds")
+} else {
+    rf.model <- readRDS("./models/rfModel.rds")
+}
+
+# GBM
+if(!file.exists("./models/gbmModel.rds")){
+    fitControl <- trainControl(method = "repeatedcv", number = 10, repeats = 3)
+    gbmGrid <- expand.grid(interaction.depth = c(1, 3, 5),
+                       n.trees = (1:10)*50,
+                       shrinkage = 0.1,
+                       n.minobsinnode = 10)
+    
+    gbm.model <- train(classe ~., 
+                    data=training.imputed, 
+                    method="gbm",
+                    distribution="multinomial",
+                    tuneGrid = gbmGrid,
+                    trControl = fitControl)
+    
+    saveRDS(gbm.model, "./models/gbmModel.rds")
+} else {
+    gbm.model <- readRDS("./models/gbmModel.rds")
+}
+
+# XGBoost
+if(!file.exists("./models/xgbModel.rds")){
+    xgb.model <- train(classe ~., data=training.imputed, method="xgbTree")
+    saveRDS(xgb.model, "./models/xgbModel.rds")
+} else {
+    xgb.model <- readRDS("./models/xgbModel.rds")
+}
+```
+
+
+## Evaluation
+When using the trained models created on the 20% test set I set aside, all models performed well but none is perfect.
+
+```{r evaluation}
+predicted.rf.testing <- predict(rf.model, newdata = test)
+predicted.gbm.testing <- predict(gbm.model, newdata = test)
+predicted.xgb.testing <- predict(xgb.model, newdata = test)
+actual.testing <- test$classe
+
+cfm.rf <- confusionMatrix(actual.testing, predicted.rf.testing)
+cfm.gbm <- confusionMatrix(actual.testing, predicted.gbm.testing)
+cfm.xgb <- confusionMatrix(actual.testing, predicted.xgb.testing)
+
+cfm.output <- data.frame(cfm.rf$overall, cfm.gbm$overall, cfm.xgb$overall)
+colnames(cfm.output) <- c('Random Forest', 'GBM', 'XGB')
+knitr::kable(t(cfm.output))
+```
+
+In order to utilise the strengths of the three models, I built a final ensemble model using the predictions of the previous models as input.
+
+```{r combined-model}
+# A final model that combines all previous
+combination.df <- data.frame(rf = predicted.rf.testing, 
+                             gbm = predicted.gbm.testing, 
+                             xgb = predicted.xgb.testing,
+                             classe=actual.testing)
+
+if(!file.exists("./models/combinationModel.rds")){
+    combination.model <- train(classe ~ ., method="rf", data=combination.df)
+    saveRDS(combination.model, "./models/combinationModel.rds")
+} else {
+    combination.model <- readRDS("./models/combinationModel.rds")
+}
+
+predicted.combination.testing <- predict(combination.model, dplyr::select(combination.df, -classe))
+
+cfm.combined <- confusionMatrix(actual.testing, predicted.combination.testing)
+
+cfm.combined.output <- data.frame(cfm.combined$overall)
+colnames(cfm.combined.output) <- c('Ensemble Model')
+knitr::kable(t(cfm.combined.output))
+```
+
+When looking at the models feature importance, it is clearly blending the different models together.
+
+```{r feature-blending}
+varImp.combination <- varImp(combination.model)
+featureImportance <- varImp.combination$importance %>% 
+    tibble::rownames_to_column() %>% 
+    arrange(desc(Overall))
+colnames(featureImportance) <- c('Feature', 'Importance')
+knitr::kable(featureImportance)
+```
+
+For the same training subjects, the excercises shouldn't change much over time, so the out of sample error should be small. If a new user subject was added though, it's possible that their way of performing the excercice would differ which would create a larger out of sample error.
+
+Since the users were the same in the final validation set though, I didn't get to a chance to see whether this is the case. The built model worked well for the submitted quizz test data too, and had 100% accuracy.
+
+```{r quizz-predictions}
+predictionSet <- read_csv('./data/pml-testing.csv')
+
+predicted.rf.final <- predict(rf.model, newdata = predictionSet)
+predicted.gbm.final <- predict(gbm.model, newdata = predictionSet)
+predicted.xgb.final <- predict(xgb.model, newdata = predictionSet)
+
+combination.df.final <- data.frame(rf = predicted.rf.final, 
+                             gbm = predicted.gbm.final, 
+                             xgb = predicted.xgb.final)
+
+predicted.combination.final <- predict(combination.model, combination.df.final)
+```
+
+
+## Appendix
+
+### Setup
+```{r, ref.label='setup', eval = FALSE, echo = TRUE}
+```
+
+### Data Analysis
+```{r, ref.label='data-analysis', eval = FALSE, echo = TRUE}
+```
+```{r, ref.label='data-analysis2', eval = FALSE, echo = TRUE}
+```
+
+### Data Preparation
+```{r, ref.label='data-preparation', eval = FALSE, echo = TRUE}
+```
+
+### Building Models
+```{r, ref.label='building-models', eval = FALSE, echo = TRUE}
+```
+
+### Evaluation
+```{r, ref.label='evaluation', eval = FALSE, echo = TRUE}
+```
+
+### Combined Model
+```{r, ref.label='combined-model', eval = FALSE, echo = TRUE}
+```
+
+### Feature Blending
+```{r, ref.label='feature-blending', eval = FALSE, echo = TRUE}
+```
+
+### Quizz Predictions
+```{r, ref.label='quizz-predictions', eval = FALSE, echo = TRUE}
+```
